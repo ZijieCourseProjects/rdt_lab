@@ -60,59 +60,27 @@ void tolayer5(int AorB, char datasent[20]);
 void starttimer(int AorB, float increment);
 void stoptimer(int AorB);
 
-#define TRUE 1
-#define FALSE 0
-typedef int bool;
-
-const int N = 200;
-struct pkt packet_buffer[N];
-int send_base = 1, next_seq_num = 1;
-bool timer_busy;
-int prev_timer_seq;
-int expected_seq_num;
-struct pkt sndpkt;
-
-struct pkt make_pkt(int ack, int seq, struct msg *message) {
-  struct pkt packet;
-  packet.checksum = 0;
-  if (message) {
-    memcpy(packet.payload, message->data, 20);
-    for (int i = 0; i < 20; ++i) {
-      packet.checksum += packet.payload[i];
-    }
-  }
-  packet.seqnum = seq;
-  packet.acknum = ack;
-  packet.checksum += seq + ack;
-  return packet;
-}
-
-bool is_corrupt(struct pkt packet, bool isAck) {
-  if (isAck) {
-    return packet.acknum != packet.checksum;
-  }
-  int testSum = packet.acknum + packet.seqnum;
-  for (int i = 0; i < 20; ++i) {
-    testSum += packet.payload[i];
-  }
-  return testSum != packet.checksum;
-}
+int a_busy = 0;
+struct pkt a_pkt_buffer;
 
 /* called from layer 5, passed the data to be sent to other side */
-void A_output(struct msg message) {
-  if (next_seq_num < send_base + N) {
-    packet_buffer[next_seq_num] = make_pkt(0, next_seq_num, &message);
-    tolayer3(0, packet_buffer[next_seq_num]);
-    printf("A sent message: %.20s, with seqNum: %d\n", message.data, next_seq_num);
-    if (send_base == next_seq_num){
-      prev_timer_seq = next_seq_num;
-      starttimer(0, 50.0);
-      timer_busy = TRUE;
-    }
-    next_seq_num++;
-  } else {
-    printf("Buffer full\n");
+void A_output(struct msg message)
+{
+  static int seqnum = 0;
+  struct pkt packet;
+  memcpy(packet.payload, message.data, 20);
+  packet.seqnum = seqnum;
+  packet.acknum = 0;
+  packet.checksum = seqnum + 0;
+  for (int i = 0; i < 20; ++i) {
+    packet.checksum += packet.payload[i];
   }
+  a_pkt_buffer = packet;
+  tolayer3(0, packet);
+  a_busy = 1;
+  printf("Sending Message: %-.20s,with seqNumber: %d From A\n",packet.payload,seqnum);
+  starttimer(0, 50);
+  seqnum = (seqnum + 1) % 2;
 }
 
 void B_output(struct msg message)  /* need be completed only for extra credit */
@@ -120,60 +88,81 @@ void B_output(struct msg message)  /* need be completed only for extra credit */
 }
 
 /* called from layer 3, when a packet arrives for layer 4 */
-void A_input(struct pkt packet) {
-  if (is_corrupt(packet, TRUE))
-    return;
-
-  //print acknum
-  printf("A received ack: %d\n", packet.acknum);
-  send_base = packet.acknum + 1;
-
-  if (send_base == next_seq_num && timer_busy){
-    stoptimer(0);
-    timer_busy = FALSE;
+void A_input(struct pkt packet)
+{
+  int count1 = 0, count0 = 0;
+  int checkACK = 0;
+  for(int i = 0;i<20;++i) {
+    if(packet.payload[i] == 1)
+      count1++;
+    else
+      count0++;
   }
+  if(count1 > count0)
+    checkACK = 1;
+  else
+    checkACK = 0;
+
+  if(checkACK != packet.acknum) {
+    printf("ACK: Corrupted Received At A\n");
+    return;
+  }
+
+  if (packet.acknum == a_pkt_buffer.seqnum) {
+    printf("ACK: %d Received At A\n",checkACK);
+    stoptimer(0);
+    a_busy = 0;
+  }
+
+  return;
 }
 
 /* called when A's timer goes off */
 void A_timerinterrupt() {
-  if(send_base != prev_timer_seq){
-    prev_timer_seq = send_base;
-    starttimer(0,40);
-    return;
-  }
-  printf("A timer interrupt\n");
-  for (int i = send_base; i < next_seq_num; i++) {
-    printf("A resending message: %.20s, with seqNum: %d\n", packet_buffer[i].payload, i);
-    tolayer3(0, packet_buffer[i]);
-  }
-  starttimer(0, 40);
+  printf("Timeout At A,Resending Previous packet\n");
+  tolayer3(0, a_pkt_buffer);
+  starttimer(0, 50.0);
 }
 
 /* the following routine will be called once (only) before any other */
 /* entity A routines are called. You can use it to do any initialization */
 void A_init() {
-  memset(packet_buffer, 0, sizeof(packet_buffer));
+  a_busy = 0;
+  memset(&a_pkt_buffer, 0, sizeof(a_pkt_buffer));
 }
 
 
 /* Note that with simplex transfer from a-to-B, there is no B_output() */
 
 /* called from layer 3, when a packet arrives for layer 4 at B*/
-void B_input(struct pkt packet) {
-  if (is_corrupt(packet, FALSE) || packet.seqnum != expected_seq_num) {
-    if (expected_seq_num != packet.seqnum) {
-      printf("B:Packet in wrong order, seq:%d, resending previous ACK:%d \n", packet.seqnum, sndpkt.acknum);
-    } else {
-      printf("B:Packet corrupted, resending previous ACk:%d \n", sndpkt.acknum);
+void B_input(struct pkt packet)
+{
+  static int flipbit = 0;
+  int checksum = 0;
+  for (int i = 0; i < 20; ++i) {
+    checksum += packet.payload[i];
+  }
+  checksum += packet.seqnum + packet.acknum;
+  if(packet.seqnum!=flipbit || checksum != packet.checksum) {
+    if(checksum != packet.checksum){
+      printf("corrupt packet at B ,resending ACK:%d\n",flipbit==1?0:1);
+    }else{
+      printf("Duplicated packet at B ,resending ACK:%d\n",flipbit==1?0:1);
     }
-    tolayer3(1, sndpkt);
+    struct pkt ack;
+    memset(ack.payload,flipbit==1?0:1,20);
+    ack.acknum = flipbit == 1?0:1;
+    tolayer3(1,ack);
     return;
   }
-  printf("B received message: %.20s, Sending ACK: %d\n", packet.payload, expected_seq_num);
-  tolayer5(1, packet.payload);
-  sndpkt = make_pkt(expected_seq_num, 0, NULL);
-  tolayer3(1, sndpkt);
-  expected_seq_num++;
+  printf("Data Received:%s At B, Sending ACK: %d\n",packet.payload,flipbit);
+  struct pkt ack;
+  memset(ack.payload,packet.seqnum,20);
+  ack.acknum = packet.seqnum;
+  tolayer3(1,ack);
+  tolayer5(1,packet.payload);
+  flipbit =  (flipbit + 1)%2;
+  return;
 }
 
 /* called when B's timer goes off */
@@ -183,8 +172,6 @@ void B_timerinterrupt() {
 /* the following rouytine will be called once (only) before any other */
 /* entity B routines are called. You can use it to do any initialization */
 void B_init() {
-  sndpkt = make_pkt(0, 0, NULL);
-  expected_seq_num = 1;
 }
 
 /*****************************************************************
@@ -257,9 +244,10 @@ int main() {
       printf(" entity: %d\n", eventptr->eventity);
     }
     time = eventptr->evtime;        /* update time to next event time */
+    if (nsim == nsimmax)
+      break;                        /* all done with simulation */
     if (eventptr->evtype == FROM_LAYER5) {
-      if (nsim < nsimmax)                        /* all done with simulation */
-        generate_next_arrival();   /* set up future arrival */
+      generate_next_arrival();   /* set up future arrival */
       /* fill in msg to give with string of same letter */
       j = nsim % 26;
       for (i = 0; i < 20; i++)
@@ -309,9 +297,9 @@ void init()                         /* initialize the simulator */
 
 #ifdef DEBUG
   nsimmax = 20;
-  lossprob = 0.04;
-  corruptprob = 0.04;
-  lambda = 1;
+  lossprob = 0;
+  corruptprob =0;
+  lambda = 5000;
   TRACE = 0;
 #else
   printf("-----  Stop and Wait Network Simulator Version 1.1 -------- \n\n");
@@ -459,6 +447,7 @@ void stoptimer(int AorB)   /* A or B is trying to stop timer */
     }
   printf("Warning: unable to cancel your timer. It wasn't running.\n");
 }
+
 
 /************************** TOLAYER3 ***************/
 void tolayer3(int AorB, struct pkt packet) /* A or B is trying to stop timer */
